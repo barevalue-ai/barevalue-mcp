@@ -1,7 +1,8 @@
 {
     "name": "barevalue-mcp",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "description": "MCP server for Barevalue AI podcast editing API",
+    "mcpName": "io.github.quietnotion/barevalue",
     "main": "dist/index.js",
     "bin": {
         "barevalue-mcp": "./dist/index.js"

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.quietnotion/barevalue",
+  "title": "Barevalue",
+  "description": "Submit podcast orders, check status, and manage webhooks via Barevalue editing API.",
+  "repository": {
+    "url": "https://github.com/quietnotion/barevalue-mcp",
+    "source": "github"
+  },
+  "version": "1.0.3",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "barevalue-mcp",
+      "version": "1.0.3",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "description": "Your Barevalue API key (get one at barevalue.com → Settings → API Keys)",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true,
+          "name": "BAREVALUE_API_KEY"
+        }
+      ]
+    }
+  ]
+}
