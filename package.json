@@ -1,0 +1,41 @@
+{
+    "name": "barevalue-mcp",
+    "version": "1.0.2",
+    "description": "MCP server for Barevalue AI podcast editing API",
+    "main": "dist/index.js",
+    "bin": {
+        "barevalue-mcp": "./dist/index.js"
+    },
+    "scripts": {
+        "build": "tsc",
+        "dev": "tsc --watch",
+        "start": "node dist/index.js",
+        "prepublishOnly": "npm run build"
+    },
+    "keywords": [
+        "mcp",
+        "model-context-protocol",
+        "barevalue",
+        "podcast",
+        "audio-editing",
+        "ai",
+        "claude"
+    ],
+    "author": "Barevalue",
+    "license": "MIT",
+    "homepage": "https://barevalue.com/docs/api-v1#mcp-integration",
+    "engines": {
+        "node": ">=18.0.0"
+    },
+    "dependencies": {
+        "@modelcontextprotocol/sdk": "^1.0.0"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "typescript": "^5.0.0"
+    },
+    "files": [
+        "dist",
+        "README.md"
+    ]
+}
