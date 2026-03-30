@@ -2,6 +2,10 @@
 
 MCP (Model Context Protocol) server for the [Barevalue](https://barevalue.com) AI podcast editing API. Allows Claude Code and other MCP-compatible tools to submit and manage podcast editing orders programmatically.
 
+## Hosted deployment
+
+A hosted deployment is available on [Fronteir AI](https://fronteir.ai/mcp/quietnotion-barevalue-mcp).
+
 ## Features
 
 - **Upload audio files** directly from your local machine
