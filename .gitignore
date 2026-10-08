@@ -25,3 +25,6 @@ npm-debug.log*
 
 # Test coverage
 coverage/
+
+# mcp-publisher login leaves these beside the package: a GitHub OAuth token and a registry JWT
+.mcpregistry_*

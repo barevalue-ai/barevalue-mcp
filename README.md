@@ -1,357 +1,123 @@
 # barevalue-mcp
 
-MCP (Model Context Protocol) server for the [Barevalue](https://barevalue.com) AI podcast editing API. Allows Claude Code and other MCP-compatible tools to submit and manage podcast editing orders programmatically.
+MCP server for [Barevalue](https://barevalue.com) AI podcast editing. Hand over a raw recording and get back a finished episode: cleaned audio, a transcript, and show notes and highlight clips for longer episodes.
 
-## Features
+It is free for agents: 10 hours of editing a month, delivered at up to 320 kbps or lossless. No payment details, and no person has to sign in or approve anything.
 
-- **Upload audio files** directly from your local machine
-- **Submit orders** for AI-powered podcast editing
-- **Check order status** and download completed files
-- **Manage webhooks** for automated notifications
-- **Pre-validate URLs** before submission to catch issues early
+## Which server to use
 
-## Prerequisites
+| You have | Use |
+|---|---|
+| A recording on this machine (Claude Code, Cursor, any local agent) | This package. It uploads the file for you |
+| A recording that already has a link | Either this package or the hosted server, `https://barevalue.com/mcp`, with nothing to install |
 
-**You need a Barevalue account** to submit orders via MCP. The **Basic plan is free** and includes minutes and orders each month. Paid plans (Starter, Creator, Pro) include more minutes, more orders, and additional features.
+This package is a bridge to the hosted server. Its tools come from the service (asked for when a client lists them, kept for five minutes), so they are always the current ones. The one thing it adds is `barevalue_upload`, which reads a file from your disk.
 
-Orders use your subscription minutes. If your account has insufficient minutes, submission will fail with `insufficient_credits` error.
+## Install
 
-**To get started:**
-- Sign up free at [barevalue.com/register](https://barevalue.com/register)
-- Or view plans at [barevalue.com/pricing](https://barevalue.com/pricing)
-
-## Installation
-
-### Option 1: npx (Recommended)
-
-No installation required. Configure Claude Code to run via npx:
-
-```json
-{
-  "mcpServers": {
-    "barevalue": {
-      "command": "npx",
-      "args": ["-y", "barevalue-mcp"],
-      "env": {
-        "BAREVALUE_API_KEY": "bv_sk_your_api_key_here"
-      }
-    }
-  }
-}
-```
-
-### Option 2: Global Install
+Claude Code:
 
 ```bash
-npm install -g barevalue-mcp
+claude mcp add barevalue -- npx -y barevalue-mcp
 ```
 
-Then configure Claude Code:
-
-```json
-{
-  "mcpServers": {
-    "barevalue": {
-      "command": "barevalue-mcp",
-      "env": {
-        "BAREVALUE_API_KEY": "bv_sk_your_api_key_here"
-      }
-    }
-  }
-}
-```
-
-## Configuration
-
-### Getting an API Key
-
-1. Log in to your [Barevalue account](https://barevalue.com/login)
-2. Navigate to **Settings** → **API Keys**
-3. Click **Create API Key**
-4. Copy the key (starts with `bv_sk_`) — it's only shown once!
-
-### Claude Code Setup
-
-Add to your Claude Code settings file (`~/.claude/settings.json`):
+Or in any MCP client's configuration:
 
 ```json
 {
   "mcpServers": {
     "barevalue": {
       "command": "npx",
-      "args": ["-y", "barevalue-mcp"],
-      "env": {
-        "BAREVALUE_API_KEY": "bv_sk_your_api_key_here"
-      }
+      "args": ["-y", "barevalue-mcp"]
     }
   }
 }
 ```
 
-### Environment Variables
+Node 18 or later.
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `BAREVALUE_API_KEY` | Yes | Your Barevalue API key (starts with `bv_sk_`) |
-| `BAREVALUE_API_URL` | No | Override API base URL (default: `https://barevalue.com/api/v1`) |
+## API key
 
-## Available Tools
+You do not need one to start. The agent calls `barevalue_register` with your email address and gets a key at once, which this server keeps for the rest of the session. You get an email with a link: until you click it the account can edit 30 minutes, after it 10 hours a month.
 
-### Account & Billing
-
-#### `barevalue_account`
-Get account information including credit balance, AI subscription status, and pricing.
-
-```
-barevalue_account
-```
-
-#### `barevalue_estimate`
-Calculate the cost of an order before submission.
-
-```
-barevalue_estimate duration_minutes=45
-```
-
-### Order Workflow
-
-#### `barevalue_upload`
-Upload an audio file from your local machine. Returns `order_id` and `s3_key` for submission.
-
-```
-barevalue_upload file_path="/path/to/episode.mp3"
-```
-
-**Supported formats:** mp3, wav, m4a, flac, aac, ogg
-**Maximum file size:** 750MB
-
-#### `barevalue_validate`
-Pre-check a file from a public URL before submission. Validates speech content (minimum 10%) and detects music-only content. Does NOT charge credits.
-
-**Note:** This is for external URLs only. Files uploaded via `barevalue_upload` don't need validation - go directly to `barevalue_submit`.
-
-```
-barevalue_validate file_url="https://example.com/episode.mp3"
-```
-
-#### `barevalue_submit`
-Submit an uploaded file for AI editing. Charges credits/subscription minutes.
-
-```
-barevalue_submit \
-  order_id=12345 \
-  s3_key="123/12345/raw/episode.mp3" \
-  podcast_name="My Podcast" \
-  episode_name="Episode 42: The Answer" \
-  processing_style="standard"
-```
-
-**Optional parameters:**
-- `episode_number` - Episode number for organization
-- `special_instructions` - Custom editing instructions (max 2000 chars)
-- `processing_style` - `standard` | `minimal` | `aggressive`
-- `host_names` - Array of host names for transcript speaker labels
-- `guest_names` - Array of guest names for transcript speaker labels
-
-#### `barevalue_submit_url`
-Submit using a public URL instead of uploading.
-
-```
-barevalue_submit_url \
-  file_url="https://example.com/episode.mp3" \
-  podcast_name="My Podcast" \
-  episode_name="Episode 42"
-```
-
-#### `barevalue_status`
-Check order status. Returns download URLs when complete.
-
-```
-barevalue_status order_id=12345
-```
-
-**Statuses:** `pending`, `downloading`, `processing`, `transcribing`, `editing`, `completed`, `failed`, `refunded`
-
-#### `barevalue_list_orders`
-List recent orders with pagination.
-
-```
-barevalue_list_orders page=1 per_page=20 status="completed"
-```
-
-### Webhooks
-
-#### `barevalue_webhooks_list`
-List all configured webhooks.
-
-#### `barevalue_webhook_create`
-Create a webhook. **Save the secret — it's only shown once!**
-
-```
-barevalue_webhook_create \
-  url="https://your-server.com/webhook" \
-  events=["order.completed", "order.failed"]
-```
-
-**Available events:** `order.completed`, `order.failed`, `order.refunded`
-
-#### `barevalue_webhook_update`
-Update webhook URL, events, or active status.
-
-```
-barevalue_webhook_update webhook_id=1 is_active=false
-```
-
-#### `barevalue_webhook_delete`
-Delete a webhook permanently.
-
-```
-barevalue_webhook_delete webhook_id=1
-```
-
-#### `barevalue_webhook_rotate_secret`
-Generate a new signing secret. Old secret stops working immediately.
-
-```
-barevalue_webhook_rotate_secret webhook_id=1
-```
-
-## Usage Examples
-
-### Complete Workflow (Local File)
-
-Here's a typical workflow for uploading a local file:
-
-```
-User: Upload and edit my podcast episode at /Users/me/recording.mp3
-
-Claude: I'll help you submit that podcast episode for editing.
-
-1. First, let me check your account balance...
-   [calls barevalue_account]
-   You have 120 AI minutes remaining on your subscription.
-
-2. Uploading the file...
-   [calls barevalue_upload file_path="/Users/me/recording.mp3"]
-   Upload complete. Order ID: 12345
-
-3. Submitting for editing...
-   [calls barevalue_submit order_id=12345 s3_key="..." podcast_name="My Show" episode_name="Episode 1"]
-   Order submitted! Estimated completion: 15 minutes.
-
-4. I'll check the status...
-   [calls barevalue_status order_id=12345]
-   Status: completed
-
-   Download links:
-   - Edited audio: https://...
-   - Transcript PDF: https://...
-   - Show notes: https://...
-```
-
-### Complete Workflow (External URL)
-
-For files already hosted online, you can validate before submitting:
-
-```
-User: Edit this podcast: https://example.com/episode.mp3
-
-Claude: I'll validate and submit that for editing.
-
-1. Checking your account...
-   [calls barevalue_account]
-   You have 50 AI bonus minutes available.
-
-2. Validating the file...
-   [calls barevalue_validate file_url="https://example.com/episode.mp3"]
-   ✓ Speech detected: 87%
-   ✓ No music-only content detected
-   Duration: 32 minutes
-
-3. Submitting for editing...
-   [calls barevalue_submit_url file_url="..." podcast_name="My Show" episode_name="Episode 5"]
-   Order submitted! Order ID: 12346
-```
-
-### Checking Multiple Orders
-
-```
-User: What's the status of my recent orders?
-
-Claude: [calls barevalue_list_orders per_page=5]
-
-Here are your recent orders:
-| Order ID | Episode | Status | Created |
-|----------|---------|--------|---------|
-| 12345 | Episode 42 | completed | 2 hours ago |
-| 12344 | Episode 41 | completed | yesterday |
-| 12343 | Episode 40 | processing | just now |
-```
-
-## Error Handling
-
-The server returns structured errors:
+If you already have a key (Settings, API Keys on barevalue.com), set it and the tools stop asking for one:
 
 ```json
-{
-  "error": "insufficient_credits",
-  "message": "Not enough credits. Need $3.15, have $2.00",
-  "statusCode": 402
-}
+"env": { "BAREVALUE_API_KEY": "bv_sk_your_key_here" }
 ```
 
-Common errors:
+## What to say
 
-| Error | Meaning |
-|-------|---------|
-| `invalid_api_key` | API key is missing, invalid, or revoked |
-| `insufficient_credits` | Not enough credits or subscription minutes |
-| `validation_failed` | File failed pre-checks (not enough speech, music detected) |
-| `file_too_large` | File exceeds 750MB limit |
-| `rate_limited` | Too many requests (limit: 10/minute) |
+> Edit the podcast episode at ~/recordings/ep42.wav with Barevalue. The show is "Tech Talk", the episode is "AI in 2026". Remove the sponsor read at the start.
 
-## Pricing
+The agent will:
 
-MCP orders use your subscription minutes — the same balance you'd use on barevalue.com. The **Basic plan is free** and includes minutes and orders each month. Paid plans include more minutes, orders, and features.
+1. Upload the file (`barevalue_upload`)
+2. Order the edit (`barevalue_submit_url`)
+3. Check on it every minute or so until it is done (`barevalue_status`), usually 5 to 15 minutes
+4. Give you the download links, and the show notes and transcript as text (`barevalue_content`)
+5. Ask whether you are happy with it and pass that on (`barevalue_feedback`), or have it edited again with your notes (`barevalue_request_revision`)
 
-**What's included with every order:**
-- Edited audio file (filler words, long pauses, false starts removed)
-- Transcript (PDF and DOCX)
-- Show notes with timestamps
-- Social media clips (AI-selected highlights)
+## Tools
 
-Use `barevalue_estimate` to check your available minutes before submitting. View plans at [barevalue.com/pricing](https://barevalue.com/pricing).
+The list comes from the service, so `tools/list` is the authority. Today:
 
-## Rate Limits
+| Tool | What it does |
+|---|---|
+| `barevalue_register` | Create an account and get an API key in one call |
+| `barevalue_upload` | Upload an audio file from this machine |
+| `barevalue_submit_url` | Order editing, for an upload or for audio at a link |
+| `barevalue_status` | Progress, time remaining, download links, what the edit changed |
+| `barevalue_content` | Show notes, transcript and edit summary as text |
+| `barevalue_feedback` | Say whether the edit was good |
+| `barevalue_request_revision` | Have a finished order edited again with new instructions |
+| `barevalue_updates` | Everything new on the account since the last call |
+| `barevalue_list_orders` | Recent orders |
+| `barevalue_account` | Minutes left this month and the pace limits |
+| `barevalue_estimate` | Whether an order of a given length would be accepted |
+| `barevalue_validate` | Pre-check audio at a link |
+| `barevalue_pricing`, `barevalue_api_status` | Plans and current processing times |
 
-- **10 requests per minute** per API key
-- File uploads have a 5-minute timeout
-- Order processing typically completes in 10-30 minutes
+## Limits
 
-## Security
+- Audio only. One file per order, with one audio track, up to 60 minutes and 750 MB
+- MP3, WAV, M4A, FLAC, AAC, OGG, Opus, WMA and AIFF
+- The free plan edits one order at a time and 120 minutes in any 5 hours
+- An uploaded file can be ordered once, within 2 hours of the upload
 
-- API keys are transmitted via environment variable, never hardcoded
-- All API communication uses HTTPS
-- Webhook signatures use HMAC-SHA256 for verification
-- Presigned S3 URLs expire after 30 minutes
+## Changes in 1.4.0
+
+- The tools now come from the hosted server. `barevalue_submit` (with `order_id`), the webhook tools and human editing are gone: the service retired them
+- `barevalue_upload` uses the new upload flow and returns an `upload_id` for `barevalue_submit_url`
+- `BAREVALUE_API_KEY` is optional
+- `BAREVALUE_API_URL` is no longer read
+- With `BAREVALUE_API_KEY` set, that key is the only one used: an `api_key` passed to a tool is ignored and `barevalue_register` does not replace it
+- `barevalue_upload` sends audio files only (by the real file's extension) and no call follows a redirect
+
+## Changes in 1.4.1
+
+- A `BAREVALUE_API_KEY` that cannot be a key (empty quotes, two layers of quotes, a quote that is not closed) stops the server at startup with one line that says how to set it. Before, the first ran without a key and the others got a 401 on every call
+- When the service refuses the key in `BAREVALUE_API_KEY` (revoked, expired, mistyped), the answer now says so and what to do: set a working key or remove the variable, then restart. That key is still the only one used. A key the session got from `barevalue_register` and that is later refused is dropped, so the agent can register again
+- `barevalue_upload` sends the file only to Barevalue's own storage host. Any other upload address is refused before a byte is sent
+- A long upload reports progress to a client that asks for it (a progress token on the call), about once a second
+- Cancelling the call stops the upload, and so does the client going away. The same file asked for again reuses the upload it had been given, so retries do not use up the account's unordered uploads
+- A second `barevalue_upload` call for a file that is still on its way joins that upload and returns the same `upload_id`, in place of sending the file twice
+- A streamed answer from the service is read correctly when it carries other messages or stays open after the answer
+- `barevalue_upload` opens the file once and sends what it checked, so a file swapped in afterwards is not sent. A file with more than one name on disk (a hard link) is refused: copy it and upload the copy. A file the program may not read is refused in plain words
 
 ## Development
 
 ```bash
-# Install dependencies
 npm install
-
-# Build
 npm run build
-
-# Watch mode
-npm run dev
+node test-mcp.js                                   # live read-only smoke test, then the local tests; no key needed
+node test-mcp.js --offline                         # the local tests only, against a stub inside the test
+BAREVALUE_API_KEY=... node test-mcp.js episode.mp3 # also uploads the file, places no order
 ```
 
 ## Support
 
-- **Documentation:** https://barevalue.com/docs/api-v1
-- **Email:** support@barevalue.com
+support@barevalue.com, or the [API documentation](https://barevalue.com/docs/api-v1).
 
 ## License
 
