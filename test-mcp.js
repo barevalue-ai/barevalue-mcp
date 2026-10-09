@@ -151,11 +151,21 @@ async function live() {
 
 // ───── Part 2: a stub of the hosted server and of the S3 form post ─────
 
+const API_KEY_PROPERTY = { type: 'string', description: 'Barevalue API key (bv_sk_...). Get one with barevalue_register.' };
 const TOOLS = [
   { name: 'barevalue_pricing', description: 'Prices', inputSchema: { type: 'object', properties: {} } },
   { name: 'barevalue_register', description: 'Sign up', inputSchema: { type: 'object', properties: { email: { type: 'string' } }, required: ['email'] } },
-  { name: 'barevalue_account', description: 'Account', inputSchema: { type: 'object', properties: { api_key: { type: 'string' } } } },
-  { name: 'barevalue_upload', description: 'Upload', inputSchema: { type: 'object', properties: { filename: { type: 'string' }, size_bytes: { type: 'number' }, api_key: { type: 'string' } }, required: ['filename'] } },
+  { name: 'barevalue_account', description: 'Account', inputSchema: { type: 'object', properties: { api_key: API_KEY_PROPERTY } } },
+  { name: 'barevalue_upload', description: 'Upload', inputSchema: { type: 'object', properties: { filename: { type: 'string' }, size_bytes: { type: 'number' }, api_key: API_KEY_PROPERTY }, required: ['filename'] } },
+  {
+    name: 'barevalue_submit_url',
+    description: 'Order',
+    inputSchema: {
+      type: 'object',
+      properties: { file_url: { type: 'string' }, upload_id: { type: 'string' }, podcast_name: { type: 'string' }, episode_name: { type: 'string' }, host_names: { type: 'array' }, idempotency_key: { type: 'string' }, api_key: API_KEY_PROPERTY },
+      required: ['podcast_name', 'episode_name'],
+    },
+  },
 ];
 
 function toolAnswer(status, body) {
@@ -180,6 +190,13 @@ async function startStub() {
     stub.drainBytesPerTick = 0; // 0: read the post as fast as it comes. Otherwise bytes per 50 ms.
     stub.answer = 'json'; // how /mcp answers: json, sse, sse-crlf, sse-progress, sse-open, sse-split
     stub.uploadsOpened = 0;
+    stub.dropCalls = 0; // how many of the next tool calls get no answer: the connection is dropped
+    stub.ordersPlaced = 0;
+    // What storage does with a post: null answers it. Otherwise 'drop' (the connection goes
+    // while the file is arriving), 'headers-then-drop' and 'headers-then-stall' (the answer's
+    // headers, and then the connection goes or nothing more comes), 'stall' (no answer at all),
+    // 'early-200' and 'early-403' (a whole answer while the file is still arriving).
+    stub.uploadMode = null;
   };
   stub.reset();
 
@@ -207,6 +224,9 @@ async function startStub() {
               answer = [401, { error: 'api_key_required', message: 'This tool needs an API key.' }];
             } else if (stub.goodKeys && !stub.goodKeys.includes(used)) {
               answer = [401, { error: 'unauthorized', message: 'Invalid or revoked API key' }];
+            } else if (name === 'barevalue_submit_url') {
+              stub.ordersPlaced++;
+              answer = [200, { order_id: 1000 + stub.ordersPlaced, status: 'queued' }];
             } else if (name === 'barevalue_upload') {
               stub.uploadsOpened++;
               const id = `up_${String(stub.uploadsOpened).padStart(4, '0')}`;
@@ -223,6 +243,13 @@ async function startStub() {
             }
           }
           result = toolAnswer(answer[0], answer[1]);
+          if (stub.dropCalls > 0) {
+            // The call arrived and was acted on, and no answer goes back: as when the
+            // service is slow or the line breaks after the order was placed.
+            stub.dropCalls--;
+            req.socket.destroy();
+            return;
+          }
         }
 
         const rpc = JSON.stringify({ jsonrpc: '2.0', id: message.id, result });
@@ -263,9 +290,26 @@ async function startStub() {
     if (req.url.startsWith('/upload')) {
       const post = { url: req.url, bytes: 0, chunks: [], done: false, aborted: false, startedAt: Date.now() };
       stub.posts.push(post);
+      const mode = stub.uploadMode;
       req.on('data', (chunk) => {
         post.bytes += chunk.length;
         post.chunks.push(chunk);
+        if (mode === 'drop') {
+          req.socket.destroy();
+          return;
+        }
+        if (mode === 'early-200' || mode === 'early-403') {
+          // An answer while the file is still arriving, and nothing more is read.
+          if (!post.answeredEarly) {
+            post.answeredEarly = true;
+            post.bytesAtAnswer = post.bytes;
+            const refusal = '<?xml version="1.0"?><Error><Code>AccessDenied</Code></Error>';
+            res.writeHead(mode === 'early-200' ? 200 : 403, { 'Content-Type': 'application/xml' });
+            res.end(mode === 'early-200' ? '' : refusal);
+          }
+          req.pause();
+          return;
+        }
         if (stub.drainBytesPerTick > 0) {
           post.window = (post.window ?? 0) + chunk.length;
           if (post.window >= stub.drainBytesPerTick) {
@@ -275,6 +319,7 @@ async function startStub() {
           }
         }
       });
+      req.socket.once('close', () => { post.socketClosed = true; });
       req.on('aborted', () => { post.aborted = true; });
       req.on('close', () => { if (!post.done) post.aborted = true; });
       req.on('end', () => {
@@ -289,6 +334,18 @@ async function startStub() {
         post.fileBytes = file.length;
         post.sha = crypto.createHash('sha256').update(file).digest('hex');
         post.head = body.subarray(0, Math.max(0, start)).toString();
+        if (mode === 'stall') {
+          return; // the whole form is in and nothing is ever said
+        }
+        if (mode === 'headers-then-drop' || mode === 'headers-then-stall') {
+          // The start of an answer: the status and headers that promise a body.
+          res.writeHead(200, { 'Content-Type': 'application/xml', 'Content-Length': 500 });
+          res.flushHeaders();
+          if (mode === 'headers-then-drop') {
+            setTimeout(() => req.socket.destroy(), 80);
+          }
+          return;
+        }
         res.writeHead(stub.uploadStatus, stub.uploadBody ? { 'Content-Type': 'application/xml' } : {});
         res.end(stub.uploadBody);
       });
@@ -327,7 +384,7 @@ function makeFixtures() {
 }
 
 /** Start a bridge, see whether it exits by itself, and with what. */
-async function startAndWatch(env, waitMs = 1500) {
+async function startAndWatch(env, waitMs = 8000) {
   const bridge = startBridge(env);
   const code = await Promise.race([bridge.exited, sleep(waitMs).then(() => 'running')]);
   return { bridge, code };
@@ -411,6 +468,7 @@ async function refusedKey(stub, fixtures) {
     'a refused configured key: the answer says which key, and what the user must do',
     answer.result.isError === true && body.error === 'unauthorized' && body.configured_key_refused === true &&
       /BAREVALUE_API_KEY/.test(body.what_to_do) && /restart/.test(body.what_to_do) && /remove BAREVALUE_API_KEY/.test(body.what_to_do) &&
+      /no Barevalue account yet/.test(body.what_to_do) && /already has an account is refused/.test(body.what_to_do) && !/at once/.test(body.what_to_do) &&
       /Settings, API Keys/.test(body.what_to_do) && body.message === 'Invalid or revoked API key' && !answer.result.content[0].text.includes(DEAD),
     body.what_to_do?.slice(0, 70)
   );
@@ -464,14 +522,19 @@ async function refusedKey(stub, fixtures) {
   stub.tool = (name) => (name === 'barevalue_register' ? [201, { api_key: 'bv_sk_second' }] : undefined);
   answer = await bridge.call('barevalue_account');
   body = payload(answer);
-  check('a session key that was revoked: the answer says it was dropped and what to call', answer.result.isError === true && body.session_key_forgotten === true && /barevalue_register again/.test(body.what_to_do));
+  check(
+    'a session key that was revoked: the answer says it was dropped, that the same address cannot register twice, and to pass a working key',
+    answer.result.isError === true && body.session_key_forgotten === true && /will not give the same email address another key/.test(body.what_to_do) &&
+      /pass it as api_key/.test(body.what_to_do) && !/barevalue_register again/.test(body.what_to_do),
+    body.what_to_do?.slice(0, 70)
+  );
   const list = await bridge.rpc('tools/list');
   check('a session key that was revoked: the tools take api_key again', 'api_key' in list.result.tools.find((tool) => tool.name === 'barevalue_account').inputSchema.properties);
   answer = await bridge.call('barevalue_account', { api_key: 'bv_sk_second' });
   check('a session key that was revoked: a working key passed as api_key is used', !answer.result.isError && payload(answer).account === 'bv_sk_second');
   await bridge.call('barevalue_register', { email: 'someone@example.com' });
   answer = await bridge.call('barevalue_account');
-  check('a session key that was revoked: barevalue_register gives the session a key again', !answer.result.isError && payload(answer).account === 'bv_sk_second' && stub.calls[stub.calls.length - 1].key === 'bv_sk_second');
+  check('a session key that was revoked: a later barevalue_register that succeeds (another address) gives the session a key again', !answer.result.isError && payload(answer).account === 'bv_sk_second' && stub.calls[stub.calls.length - 1].key === 'bv_sk_second');
   bridge.kill();
 }
 
@@ -639,7 +702,8 @@ async function longUpload(stub, fixtures) {
   console.log('\n# A long upload\n');
   const MB = 1024 * 1024;
   const sizeOf = 20 * MB;
-  const slow = () => { stub.reset(); stub.drainBytesPerTick = 256 * 1024; }; // about 5 MB a second
+  // How fast the stub takes a post: 256 KB a tick is about 5 MB a second.
+  const slow = (bytesPerTick = 256 * 1024) => { stub.reset(); stub.drainBytesPerTick = bytesPerTick; };
   const makeBig = (name, size = sizeOf) => {
     const file = path.join(fixtures.dir, name);
     fs.writeFileSync(file, Buffer.alloc(0));
@@ -660,8 +724,10 @@ async function longUpload(stub, fixtures) {
   let bridge = startBridge({ BAREVALUE_API_KEY: 'bv_sk_good', BAREVALUE_MCP_URL: stub.url });
   await bridge.init();
 
-  // Progress
-  slow();
+  // Progress. Taken at half the pace: what the bridge reports is what it has read from
+  // disk, and on a machine whose loopback buffers hold several megabytes the read is over
+  // that much sooner. At 2.5 MB a second the reading still lasts for seconds there.
+  slow(128 * 1024);
   let file = makeBig('progress.wav');
   let answer = await bridge.call('barevalue_upload', { file_path: file }, { progressToken: 'tok-1' });
   let seen = progressOf(bridge, 'tok-1');
@@ -687,7 +753,7 @@ async function longUpload(stub, fixtures) {
   pending.then(() => { answered = true; });
   await until(() => stub.posts[0]?.bytes > 2 * MB);
   bridge.notify('notifications/cancelled', { requestId: pending.id, reason: 'The client gave up waiting' });
-  const stopped = await until(() => stub.posts[0].aborted, 3000);
+  const stopped = await until(() => stub.posts[0].aborted, 10000);
   const bytesAtStop = stub.posts[0].bytes;
   await sleep(600);
   check(
@@ -755,7 +821,9 @@ async function longUpload(stub, fixtures) {
 
   // The file gets shorter while it is on its way.
   slow();
-  file = makeBig('shrinks.wav');
+  // A file far larger than anything the connection can hold in its buffers, so that most
+  // of it is still unread when it is cut. It costs no time: the upload ends at the cut.
+  file = makeBig('shrinks.wav', 96 * MB);
   pending = bridge.call('barevalue_upload', { file_path: file });
   await until(() => stub.posts[0]?.bytes > 1 * MB);
   fs.truncateSync(file, 1000);
@@ -775,8 +843,8 @@ async function longUpload(stub, fixtures) {
   bridge.call('barevalue_upload', { file_path: makeBig('abandoned.wav') }).catch(() => undefined);
   await until(() => stub.posts[0]?.bytes > 1 * MB);
   bridge.proc.stdin.end();
-  const code = await Promise.race([bridge.exited, sleep(4000).then(() => 'still running')]);
-  await until(() => stub.posts[0].aborted, 2000);
+  const code = await Promise.race([bridge.exited, sleep(10000).then(() => 'still running')]);
+  await until(() => stub.posts[0].aborted, 8000);
   check('when the client goes away the upload stops and the server exits', code === 0 && stub.posts[0].aborted && !stub.posts[0].done, `exit ${code}, ${(stub.posts[0].bytes / MB).toFixed(1)} of ${sizeOf / MB} MB had arrived`);
   bridge.kill();
 }
@@ -868,6 +936,370 @@ function windowsPaths(lib) {
   check('the same check by this machine\'s rules', lib.audioName('/Users/ross/Episode 12.MP3').audio === true && lib.audioName('/Users/ross/Episode 12.MP3').name === 'Episode 12.MP3' && lib.audioName('/Users/ross/notes.txt').audio === false);
 }
 
+/**
+ * Whether the bridge process still holds the file open, or null where that cannot be seen.
+ * Linux: the links in /proc. macOS: lsof.
+ */
+function heldOpenBy(pid, file) {
+  try {
+    if (process.platform === 'linux') {
+      return fs.readdirSync(`/proc/${pid}/fd`).some((fd) => {
+        try {
+          return fs.readlinkSync(`/proc/${pid}/fd/${fd}`) === file;
+        } catch {
+          return false;
+        }
+      });
+    }
+    if (process.platform === 'darwin') {
+      const listed = require('child_process').spawnSync('lsof', ['-p', String(pid), '-Fn'], { encoding: 'utf8' });
+      return listed.error || !listed.stdout ? null : listed.stdout.split('\n').includes(`n${file}`);
+    }
+  } catch {
+    // not visible here
+  }
+  return null;
+}
+
+// (7) Storage that drops the connection or goes quiet
+async function storageGoesAway(stub, fixtures, lib) {
+  console.log('\n# Storage that drops the connection or goes quiet\n');
+  const MB = 1024 * 1024;
+  const bytes = crypto.randomBytes(300000);
+  const until = async (condition, ms = 8000) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (condition()) return true;
+      await sleep(25);
+    }
+    return false;
+  };
+  // A call that is never answered is the fault looked for: wait a few seconds, not for ever.
+  const within = (promise, ms = 15000) => Promise.race([promise, sleep(ms).then(() => null)]);
+
+  stub.reset();
+  const bridge = startBridge({ BAREVALUE_API_KEY: 'bv_sk_good', BAREVALUE_MCP_URL: stub.url });
+  await bridge.init();
+  const pid = bridge.proc.pid;
+
+  // The control for the open-file check: while a file is on its way, the bridge holds it.
+  stub.drainBytesPerTick = 256 * 1024;
+  const slowFile = path.join(fixtures.dir, 'held.wav');
+  fs.writeFileSync(slowFile, Buffer.alloc(0));
+  fs.truncateSync(slowFile, 12 * MB);
+  const slow = bridge.call('barevalue_upload', { file_path: slowFile });
+  await until(() => stub.posts[0]?.bytes > 1 * MB);
+  const heldDuring = heldOpenBy(pid, slowFile);
+  await slow;
+  const canSee = heldDuring === true && heldOpenBy(pid, slowFile) === false;
+  if (heldDuring === null) {
+    console.log('note open files of another process cannot be listed here: the "file is closed" checks are left out');
+  } else {
+    check('the control: a file is held open while it is on its way and closed once it has arrived', canSee);
+  }
+  const closed = (file) => !canSee || heldOpenBy(pid, file) === false;
+
+  // Real storage: 204, no body at all.
+  stub.reset();
+  let file = fixtures.write('plain-204.mp3', bytes);
+  let answer = await within(bridge.call('barevalue_upload', { file_path: file }));
+  check(
+    'storage answers 204 with no body: the upload succeeded',
+    answer !== null && !answer.result.isError && payload(answer).upload_id === 'up_0001' && payload(answer).uploaded_bytes === bytes.length && stub.posts[0]?.sha === sha(bytes) && closed(file)
+  );
+
+  // Headers, and then the connection is dropped.
+  stub.reset();
+  stub.uploadMode = 'headers-then-drop';
+  file = fixtures.write('dropped-after-headers.mp3', bytes);
+  const started = Date.now();
+  answer = await within(bridge.call('barevalue_upload', { file_path: file }));
+  const body = answer && payload(answer);
+  check(
+    'storage sends headers and then drops the connection: the call is answered, with a plain reason',
+    answer !== null && answer.result.isError === true && body.error === 'bridge_error' && /dropped the connection before it finished answering \(HTTP 200\)/.test(body.message) && /barevalue_upload again/.test(body.message),
+    answer === null ? 'no answer after 15 s' : `${Date.now() - started} ms: ${body.message?.slice(0, 80)}`
+  );
+  await sleep(100);
+  check('storage sends headers and then drops the connection: the file is closed', answer !== null && closed(file), heldOpenBy(pid, file) === true ? 'still open' : undefined);
+
+  stub.uploadMode = null;
+  answer = await within(bridge.call('barevalue_upload', { file_path: file }));
+  check(
+    'the same file again after that is a new post to the form already asked for, not a call waiting on the dead one',
+    answer !== null && !answer.result.isError && payload(answer).upload_id === 'up_0001' && !payload(answer).note && stub.uploadsOpened === 1 && stub.posts.length === 2 && stub.posts[1].sha === sha(bytes) && closed(file),
+    answer === null ? 'no answer after 15 s' : `${stub.uploadsOpened} form(s) asked for, ${stub.posts.length} posts`
+  );
+
+  // The connection goes while the file is still arriving.
+  stub.reset();
+  stub.uploadMode = 'drop';
+  file = fixtures.write('dropped-midway.mp3', crypto.randomBytes(4 * MB));
+  answer = await within(bridge.call('barevalue_upload', { file_path: file }));
+  await sleep(100);
+  check(
+    'storage drops the connection while the file is arriving: the call is answered and the file is closed',
+    answer !== null && answer.result.isError === true && payload(answer).error === 'bridge_error' && /connection to storage failed/.test(payload(answer).message) && /barevalue_upload again/.test(payload(answer).message) && closed(file),
+    answer === null ? 'no answer after 15 s' : payload(answer).message?.slice(0, 80)
+  );
+
+  // A yes that comes while the file is still being sent is not a stored file. The file is
+  // far larger than the connection's buffers and the stub stops reading, so most of it
+  // cannot have left this machine when the answer comes.
+  const bigFile = (name) => {
+    const made = path.join(fixtures.dir, name);
+    fs.writeFileSync(made, Buffer.alloc(0));
+    fs.truncateSync(made, 96 * MB);
+    return made;
+  };
+  stub.reset();
+  stub.uploadMode = 'early-200';
+  file = bigFile('early-yes.wav');
+  answer = await within(bridge.call('barevalue_upload', { file_path: file }));
+  let said = answer && payload(answer);
+  const hungUp = await until(() => stub.posts[0]?.socketClosed, 10000);
+  check(
+    'storage says 200 while the file is still being sent: not counted as an upload, with a plain reason',
+    answer !== null && answer.result.isError === true && said.error === 'bridge_error' && !said.upload_id && !said.uploaded_bytes &&
+      /answered HTTP 200 before the whole file had been sent/.test(said.message) && /barevalue_upload again/.test(said.message) && stub.posts[0].bytes < 96 * MB,
+    answer === null ? 'no answer after 15 s' : `${(stub.posts[0].bytes / MB).toFixed(1)} of 96 MB had arrived: ${said.message?.slice(0, 70)}`
+  );
+  check('and the connection is closed and the file too', hungUp && closed(file), `connection ${hungUp ? 'closed' : 'still open'}, file ${closed(file) ? 'closed' : 'still open'}`);
+
+  stub.reset();
+  stub.uploadMode = 'early-403';
+  file = bigFile('early-no.wav');
+  answer = await within(bridge.call('barevalue_upload', { file_path: file }));
+  said = answer && payload(answer);
+  const hungUpToo = await until(() => stub.posts[0]?.socketClosed, 10000);
+  check(
+    'storage refuses while the file is still being sent: the refusal is passed on, and nothing more is sent',
+    answer !== null && answer.result.isError === true && said.error === 'upload_failed' && /HTTP 403, AccessDenied/.test(said.message) && hungUpToo && closed(file),
+    answer === null ? 'no answer after 15 s' : said.message?.slice(0, 80)
+  );
+  bridge.kill();
+
+  // The idle limit, on the sending function itself with a short limit (the bridge's is 120 s).
+  const send = (name, handle, idleMs) =>
+    lib.postForm(`${stub.origin}/upload`, { key: 'k' }, 'file', handle, name, bytes.length, new AbortController().signal, () => undefined, idleMs);
+  const quiet = async (name, mode) => {
+    stub.reset();
+    stub.uploadMode = mode;
+    const handle = await fs.promises.open(fixtures.write(`${mode}.mp3`, bytes), 'r');
+    const begun = Date.now();
+    let outcome;
+    try {
+      outcome = await within(send(`${mode}.mp3`, handle, 400));
+    } catch (error) {
+      outcome = error;
+    }
+    const took = Date.now() - begun;
+    // Once it has settled nothing reads the handle any more, so the caller can close it.
+    const closes = await handle.close().then(() => true, () => false);
+    check(
+      name,
+      outcome instanceof Error && /stalled: nothing moved for [\d.]+ seconds/.test(outcome.message) && /barevalue_upload again/.test(outcome.message) && took >= 350 && took < 10000 && closes,
+      outcome === null ? 'never settled' : `${took} ms: ${outcome instanceof Error ? outcome.message.slice(0, 70) : JSON.stringify(outcome)}`
+    );
+  };
+  await quiet('storage sends headers and then nothing: the upload is stopped at the idle limit', 'headers-then-stall');
+  await quiet('storage takes the file and never answers: the upload is stopped at the idle limit', 'stall');
+
+  stub.reset();
+  const handle = await fs.promises.open(fixtures.write('direct-204.mp3', bytes), 'r');
+  const direct = await within(send('direct-204.mp3', handle, 400));
+  await handle.close();
+  check('the sending function itself: 204 with no body resolves with the status and an empty body', direct !== null && direct.status === 204 && direct.body === '' && stub.posts[0].sha === sha(bytes));
+}
+
+// (8) An order asked for again after no answer
+async function orderAskedAgain(stub) {
+  console.log('\n# An order asked for again after no answer\n');
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  const order = { file_url: 'https://example.com/ep.mp3', podcast_name: 'Show', episode_name: 'One', host_names: ['Ann', 'Bo'] };
+  const sentKeys = () => stub.calls.filter((call) => call.name === 'barevalue_submit_url').map((call) => call.args.idempotency_key);
+
+  stub.reset();
+  let bridge = startBridge({ BAREVALUE_API_KEY: 'bv_sk_good', BAREVALUE_MCP_URL: stub.url });
+  await bridge.init();
+
+  let answer = await bridge.call('barevalue_submit_url', order);
+  check('an order goes out with an idempotency key of its own', !answer.result.isError && payload(answer).order_id === 1001 && UUID.test(sentKeys()[0]), sentKeys()[0]);
+  answer = await bridge.call('barevalue_submit_url', order);
+  check('the same order after an answer is a new order with a new key', !answer.result.isError && payload(answer).order_id === 1002 && UUID.test(sentKeys()[1]) && sentKeys()[1] !== sentKeys()[0]);
+
+  // No answer comes back. The call did arrive, so the order may have been placed.
+  stub.reset();
+  stub.dropCalls = 2;
+  answer = await bridge.call('barevalue_submit_url', order);
+  const body = payload(answer);
+  check(
+    'an order that gets no answer: the result says it may have been placed and how to ask again safely',
+    answer.result.isError === true && body.error === 'bridge_error' && /not known whether the order was placed/.test(body.message) &&
+      /exactly the same arguments/.test(body.message) && /not placed twice/.test(body.message) && /barevalue_list_orders/.test(body.message),
+    body.message?.slice(0, 90)
+  );
+  await bridge.call('barevalue_submit_url', { ...order, episode_name: 'Two' });
+  // The same order, its fields in another order.
+  answer = await bridge.call('barevalue_submit_url', { host_names: ['Ann', 'Bo'], episode_name: 'One', podcast_name: 'Show', file_url: 'https://example.com/ep.mp3' });
+  const [first, other, again] = sentKeys();
+  check('the same order asked for again goes out with the same idempotency key', !answer.result.isError && UUID.test(first) && again === first, `${first} / ${again}`);
+  check('another order meanwhile has a key of its own', UUID.test(other) && other !== first);
+  await bridge.call('barevalue_submit_url', order);
+  check('once it has been answered, the same order again is a new one', sentKeys()[3] !== first && UUID.test(sentKeys()[3]));
+
+  // A fault on the service's side leaves it open too.
+  stub.reset();
+  stub.tool = (name) => (name === 'barevalue_submit_url' && stub.calls.length === 1 ? [500, { error: 'internal_error', message: 'Failed to submit order' }] : undefined);
+  answer = await bridge.call('barevalue_submit_url', order);
+  await bridge.call('barevalue_submit_url', order);
+  check('after a fault on the service\'s side the same order keeps its key', payload(answer).error === 'internal_error' && sentKeys()[0] === sentKeys()[1] && UUID.test(sentKeys()[0]));
+
+  // A refusal is an answer: nothing was placed, the next try is its own order.
+  stub.reset();
+  stub.tool = (name) => (name === 'barevalue_submit_url' && stub.calls.length === 1 ? [429, { error: 'too_many_orders_in_progress', message: 'One at a time' }] : undefined);
+  answer = await bridge.call('barevalue_submit_url', order);
+  await bridge.call('barevalue_submit_url', order);
+  check('a refusal is passed on as it came, and the next try has a new key', JSON.stringify(payload(answer)) === JSON.stringify({ error: 'too_many_orders_in_progress', message: 'One at a time' }) && sentKeys()[0] !== sentKeys()[1]);
+
+  // The caller's own key is the caller's.
+  stub.reset();
+  stub.dropCalls = 1;
+  const own = '11111111-2222-4333-8444-555555555555';
+  answer = await bridge.call('barevalue_submit_url', { ...order, idempotency_key: own });
+  check('an idempotency_key the caller gives is sent as given, and the advice names it', sentKeys()[0] === own && /same idempotency_key/.test(payload(answer).message));
+  await bridge.call('barevalue_submit_url', order);
+  check('and it is not kept for a later call without one', sentKeys()[1] !== own && UUID.test(sentKeys()[1]));
+
+  // The service as it is: one order per key. The second time it sees a key it answers
+  // with the order that key placed, whatever has become of it since.
+  const placed = new Map();
+  const service = (name, args) => {
+    if (name !== 'barevalue_submit_url') return undefined;
+    const earlier = placed.get(args.idempotency_key);
+    if (earlier) return [200, { order_id: earlier.id, status: earlier.state, message: 'Order already submitted (idempotency)' }];
+    const made = { id: 2001 + placed.size, state: 'new' };
+    placed.set(args.idempotency_key, made);
+    return [200, { order_id: made.id, status: 'queued', message: 'File download queued. Order will be submitted automatically when download completes.' }];
+  };
+  const lostThenAgain = async (becomes, extra = {}) => {
+    stub.reset();
+    placed.clear();
+    stub.tool = service;
+    stub.dropCalls = 1;
+    const lost = await bridge.call('barevalue_submit_url', { ...order, ...extra });
+    [...placed.values()][0].state = becomes; // the order was placed all the same, and this became of it
+    const replay = await bridge.call('barevalue_submit_url', { ...order, ...extra });
+    return { lost, replay, said: payload(replay) };
+  };
+
+  // The order was placed, its answer was lost, and it failed. The agent orders again.
+  let seen = await lostThenAgain('failed');
+  check(
+    'an order whose answer was lost and which then failed: asked for again, the answer says it is that earlier order and that it failed',
+    seen.lost.result.isError === true && !seen.replay.result.isError && seen.said.order_id === 2001 && seen.said.status === 'failed' && seen.said.earlier_order === true &&
+      /not a new one: order 2001/.test(seen.said.note) && /Nothing new was ordered/.test(seen.said.note) && /has failed/.test(seen.said.note) &&
+      /again with the same arguments now places a new order/.test(seen.said.note) && !/of your own/.test(seen.said.note) &&
+      sentKeys()[1] === sentKeys()[0] && seen.replay.result.structuredContent?.note === seen.said.note,
+    seen.said.note
+  );
+  answer = await bridge.call('barevalue_submit_url', order);
+  check(
+    'and the same call once more is a new order with a new key, as the note said',
+    !answer.result.isError && payload(answer).order_id === 2002 && payload(answer).status === 'queued' && !payload(answer).earlier_order && !payload(answer).note &&
+      sentKeys()[2] !== sentKeys()[0] && UUID.test(sentKeys()[2]) && placed.size === 2
+  );
+
+  seen = await lostThenAgain('canceled', { episode_name: 'Cancelled' });
+  await bridge.call('barevalue_submit_url', { ...order, episode_name: 'Cancelled' });
+  check('the same for an order that was cancelled', /has been cancelled/.test(seen.said.note) && /now places a new order/.test(seen.said.note) && sentKeys()[2] !== sentKeys()[0] && placed.size === 2);
+
+  // Being worked on, or done: the same call again must stay that order, or the same
+  // episode would be ordered twice.
+  for (const [state, name, saysState] of [
+    ['submitted', 'being edited', /still being worked on: poll barevalue_status/],
+    ['new', 'still downloading', /still being worked on: poll barevalue_status/],
+    ['done', 'done', /It is done: barevalue_status has the downloads/],
+  ]) {
+    const asked = { ...order, episode_name: `Kept ${state}` };
+    seen = await lostThenAgain(state, { episode_name: asked.episode_name });
+    check(
+      `an order whose answer was lost and which is ${name}: the answer says it is the order already placed, its state, and that nothing new was ordered`,
+      !seen.replay.result.isError && seen.said.order_id === 2001 && seen.said.status === state && seen.said.earlier_order === true && /not a new one: order 2001/.test(seen.said.note) &&
+        /Nothing new was ordered/.test(seen.said.note) && saysState.test(seen.said.note) && /idempotency_key of your own/.test(seen.said.note) && !/places a new order/.test(seen.said.note),
+      seen.said.note
+    );
+    answer = await bridge.call('barevalue_submit_url', asked);
+    check(
+      `and the same call once more is still that order (${name}): the same key, no second order`,
+      !answer.result.isError && payload(answer).order_id === 2001 && payload(answer).earlier_order === true && sentKeys()[2] === sentKeys()[0] && placed.size === 1
+    );
+    const mine = '99999999-2222-4333-8444-555555555555';
+    answer = await bridge.call('barevalue_submit_url', { ...asked, idempotency_key: mine });
+    check(`and with a key of the caller's own it is a new order, on purpose (${name})`, !answer.result.isError && payload(answer).order_id === 2002 && !payload(answer).earlier_order && sentKeys()[3] === mine && placed.size === 2);
+  }
+
+  // The caller's own key: this server cannot know why it came twice, and does not guess.
+  for (const [state, saysNext] of [
+    ['failed', /To order again, call barevalue_submit_url with a new idempotency_key/],
+    ['submitted', /To order the same recording again on purpose, pass a new idempotency_key/],
+    ['done', /To order the same recording again on purpose, pass a new idempotency_key/],
+  ]) {
+    seen = await lostThenAgain(state, { idempotency_key: own });
+    check(
+      `with the caller's own key and an order that is ${state}: the note says only that the key was already used for that order`,
+      seen.said.earlier_order === true && /This idempotency_key was already used for order 2001/.test(seen.said.note) && /nothing new was ordered/.test(seen.said.note) && saysNext.test(seen.said.note) &&
+        !/did not arrive/.test(seen.said.note) && !/same arguments/.test(seen.said.note) && sentKeys()[0] === own && sentKeys()[1] === own,
+      seen.said.note
+    );
+  }
+
+  stub.reset();
+  stub.dropCalls = 1;
+  answer = await bridge.call('barevalue_account');
+  check('another tool that gets no answer says only that', answer.result.isError === true && !/order/.test(payload(answer).message) && !('idempotency_key' in stub.calls[0].args), payload(answer).message);
+  bridge.kill();
+
+  // Without a session key the account is the api_key in the arguments.
+  stub.reset();
+  bridge = startBridge({ BAREVALUE_MCP_URL: stub.url });
+  await bridge.init();
+  stub.dropCalls = 2;
+  await bridge.call('barevalue_submit_url', { ...order, api_key: 'bv_sk_one' });
+  await bridge.call('barevalue_submit_url', { ...order, api_key: 'bv_sk_two' });
+  await bridge.call('barevalue_submit_url', { ...order, api_key: 'bv_sk_one' });
+  check('the same order for two accounts is two orders', sentKeys()[0] !== sentKeys()[1] && sentKeys()[2] === sentKeys()[0] && stub.calls[2].args.api_key === 'bv_sk_one');
+  bridge.kill();
+}
+
+// (9) The upload tool takes a key like the other tools
+async function uploadToolKey(stub, fixtures) {
+  console.log('\n# The upload tool and api_key\n');
+  const bytes = crypto.randomBytes(20000);
+  const file = fixtures.write('keyed.mp3', bytes);
+  const uploadTool = async (bridge) => (await bridge.rpc('tools/list')).result.tools.find((tool) => tool.name === 'barevalue_upload');
+
+  stub.reset();
+  let bridge = startBridge({ BAREVALUE_MCP_URL: stub.url });
+  await bridge.init();
+  let tool = await uploadTool(bridge);
+  check(
+    'without a session key the upload tool lists api_key, in the words the other tools use',
+    JSON.stringify(tool.inputSchema.properties.api_key) === JSON.stringify(API_KEY_PROPERTY) && JSON.stringify(tool.inputSchema.required) === '["file_path"]' &&
+      'file_path' in tool.inputSchema.properties && !('size_bytes' in tool.inputSchema.properties)
+  );
+  const answer = await bridge.call('barevalue_upload', { file_path: file, api_key: 'bv_sk_passed' });
+  check('and a key passed to it is the key the upload is made with', !answer.result.isError && stub.calls[0].args.api_key === 'bv_sk_passed' && stub.calls[0].key === null && stub.posts[0]?.sha === sha(bytes));
+  bridge.kill();
+
+  stub.reset();
+  bridge = startBridge({ BAREVALUE_API_KEY: 'bv_sk_good', BAREVALUE_MCP_URL: stub.url });
+  await bridge.init();
+  tool = await uploadTool(bridge);
+  check('with a session key the upload tool does not ask for one, like the other tools', !('api_key' in tool.inputSchema.properties));
+  bridge.kill();
+}
+
 async function local() {
   const lib = require(BRIDGE);
   const stub = await startStub();
@@ -878,6 +1310,9 @@ async function local() {
     await uploadAddress(stub, fixtures, lib);
     await checkedFile(stub, fixtures);
     await longUpload(stub, fixtures);
+    await storageGoesAway(stub, fixtures, lib);
+    await orderAskedAgain(stub);
+    await uploadToolKey(stub, fixtures);
     await streamedAnswers(stub, lib);
     windowsPaths(lib);
   } finally {

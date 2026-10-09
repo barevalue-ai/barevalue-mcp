@@ -37,7 +37,7 @@ With several orders running, call `barevalue_updates` once a minute instead of p
 When the recording is a file on the machine you are running on:
 
 1. `barevalue_upload` with `filename` (and `size_bytes` if you know it). It returns `upload_id` and a ready `curl` command.
-2. Run that command with the path to the file. It answers `204` when the upload worked. The upload link works for 15 minutes.
+2. Run that command with the path to the file in place of `/path/to/your/audio`. Keep that argument in single quotes, `-F 'file=@/the/path'`, never double quotes: inside double quotes the shell acts on a `$`, a backtick or a `"` in the path. A `'` in the path is written `'\''`. curl itself stops at a comma or a semicolon in the path, so copy such a file to a plain name first. It answers `204` when the upload worked. The upload link works for 15 minutes.
 3. `barevalue_submit_url` with `upload_id` in place of `file_url`, then carry on from step 3 of the order of calls.
 
 One audio file, up to 750 MB. An upload can be ordered once. If the recording already has a direct link, skip this and pass the link. Through the npm package `barevalue-mcp`, `barevalue_upload` takes the path to the file and uploads it itself, so there is no command to run.

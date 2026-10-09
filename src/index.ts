@@ -48,6 +48,9 @@ const PROGRESS_EVERY_MS = 1000;
 const SPARE_FORM_MARGIN_MINUTES = 5;
 const CANCELLED = 'The upload was stopped because the call was cancelled.';
 const UPLOAD_TOOL = 'barevalue_upload';
+const SUBMIT_TOOL = 'barevalue_submit_url';
+// How long an order that got no answer keeps its idempotency key for the same call made again.
+const SUBMIT_KEY_MINUTES = 30;
 // What the upload tool will read from this machine: recordings, by the name of the real file.
 // The formats the service lists (GET /api/v1, supported_formats), and two other spellings.
 const AUDIO_EXTENSIONS = ['.mp3', '.wav', '.m4a', '.flac', '.aac', '.ogg', '.wma', '.aiff', '.aif', '.opus'];
@@ -302,6 +305,9 @@ async function listTools(): Promise<Tool[]> {
 function present(tools: Tool[]): Tool[] {
   return tools.map((tool) => {
     if (tool.name === UPLOAD_TOOL) {
+      // The key is taken here as on every other tool, in the service's own words, and
+      // like there it is no longer asked for once this session has one.
+      const keyProperty = tool.inputSchema?.properties?.api_key;
       return {
         ...tool,
         description:
@@ -313,6 +319,7 @@ function present(tools: Tool[]): Tool[] {
           properties: {
             file_path: { type: 'string', description: 'Absolute path to the audio file on this machine' },
             filename: { type: 'string', description: 'Optional name to store it under. Defaults to the name of the file.' },
+            ...(!apiKey && keyProperty ? { api_key: keyProperty } : {}),
           },
           required: ['file_path'],
         },
@@ -345,6 +352,41 @@ function payloadOf(result: ToolResult): Record<string, unknown> | null {
   }
 }
 
+/** Orders that went out and got no answer: what was asked, and the idempotency key it went with. */
+const unansweredSubmits = new Map<string, { key: string; until: number }>();
+
+/** The same value written the same way whatever order its fields came in. */
+function stable(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stable).join(',')}]`;
+  }
+  if (value !== null && typeof value === 'object') {
+    const fields = value as Record<string, unknown>;
+    return `{${Object.keys(fields).sort().map((name) => `${JSON.stringify(name)}:${stable(fields[name])}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/** What makes two calls the same order: the account and everything asked for. */
+function submitMark(sessionKey: string | null, args: Record<string, unknown>): string {
+  const { api_key: argumentKey, idempotency_key: _unused, ...asked } = args;
+  return stable([sessionKey ?? argumentKey ?? null, asked]);
+}
+
+/** The idempotency key for this order: the one it already went out with, or a new one. */
+function idempotencyKeyFor(mark: string): string {
+  const now = Date.now();
+  for (const [other, waiting] of unansweredSubmits) {
+    if (waiting.until <= now || (unansweredSubmits.size > 50 && other !== mark)) {
+      unansweredSubmits.delete(other);
+    }
+  }
+
+  const key = unansweredSubmits.get(mark)?.key ?? randomUUID();
+  unansweredSubmits.set(mark, { key, until: now + SUBMIT_KEY_MINUTES * 60 * 1000 });
+  return key;
+}
+
 async function callHostedTool(name: string, given: Record<string, unknown>, cancel?: AbortSignal): Promise<ToolResult> {
   // Once this session has a key, it is the only one used: the service prefers an api_key
   // argument over the header, and the arguments are written by a model that reads text
@@ -356,8 +398,73 @@ async function callHostedTool(name: string, given: Record<string, unknown>, canc
     delete args.api_key;
   }
 
-  const result = (await hosted('tools/call', { name, arguments: args }, cancel)) as unknown as ToolResult;
+  // An order goes out with an idempotency key, and the same order asked for again while
+  // the first call is still unanswered goes out with the same one. The service places one
+  // order per key, so "it timed out, try again" cannot place a second.
+  const ownKey = typeof args.idempotency_key === 'string' && args.idempotency_key !== '';
+  const submit = name === SUBMIT_TOOL && !ownKey ? submitMark(sentKey, args) : null;
+  if (submit !== null) {
+    args.idempotency_key = idempotencyKeyFor(submit);
+  }
+
+  let result: ToolResult;
+  try {
+    result = (await hosted('tools/call', { name, arguments: args }, cancel)) as unknown as ToolResult;
+  } catch (error) {
+    if (name !== SUBMIT_TOOL || cancel?.aborted) {
+      throw error;
+    }
+    // No answer: the order may or may not have been placed. Say how to ask again safely.
+    throw new Error(
+      `${error instanceof Error ? error.message : 'The call could not be made.'} It is not known whether the order was placed. ` +
+        (ownKey
+          ? 'Call barevalue_submit_url again with the same idempotency_key: the order is not placed twice.'
+          : `Call barevalue_submit_url again with exactly the same arguments: for ${SUBMIT_KEY_MINUTES} minutes this server sends the same idempotency key with them, so the order is not placed twice. ` +
+            'Before ordering with different arguments, look in barevalue_list_orders.')
+    );
+  }
   const answer = payloadOf(result);
+
+  // The key was one the service had already seen: its answer is the order that key placed
+  // (the order's own state as status: new, submitted, in_progress_submitted, done, failed,
+  // canceled), not a new order.
+  const replayed = name === SUBMIT_TOOL && !result.isError && answer !== null && typeof answer.message === 'string' && /already submitted/i.test(answer.message);
+  const state = replayed && typeof answer?.status === 'string' ? answer.status : '';
+  const over = state === 'failed' || state === 'canceled' || state === 'cancelled';
+
+  // The service answered: the order was placed or refused, and the next one is a new
+  // order with a new key. Two answers leave the key where it is. A fault on the service's
+  // side, like no answer, leaves open whether the order was placed. And an earlier order
+  // that is being worked on or is done: the same call once more must stay that order, or
+  // it would place the same episode twice. An earlier order that failed or was cancelled
+  // ends the key, so that ordering again is a new order, which is what the service's own
+  // advice for a failed order asks for.
+  if (submit !== null && !(result.isError && answer?.error === 'internal_error') && !(replayed && !over)) {
+    unansweredSubmits.delete(submit);
+  }
+
+  // Say that it is the earlier order and what has become of it, or the agent takes an old
+  // order for the one it has just asked for. With the caller's own key this server cannot
+  // know why the key came twice, so it says only that it did.
+  if (replayed && answer !== null) {
+    const order = `order ${String(answer.order_id)}`;
+    const what = ownKey
+      ? `This idempotency_key was already used for ${order}, so this is that order and nothing new was ordered.`
+      : `This is the order you already placed, not a new one: ${order}, placed by an earlier call with the same arguments whose answer did not arrive. Nothing new was ordered.`;
+    const became = over
+      ? `That order has ${state === 'failed' ? 'failed' : 'been cancelled'}: barevalue_status says why.`
+      : state === 'done'
+        ? 'It is done: barevalue_status has the downloads.'
+        : 'It is still being worked on: poll barevalue_status with this order_id.';
+    const next = over
+      ? ownKey
+        ? 'To order again, call barevalue_submit_url with a new idempotency_key.'
+        : 'Calling barevalue_submit_url again with the same arguments now places a new order.'
+      : ownKey
+        ? 'To order the same recording again on purpose, pass a new idempotency_key.'
+        : 'The same call again gives this order again. To order the same recording again on purpose, pass an idempotency_key of your own (a new UUID).';
+    return withFields(result, answer, { earlier_order: true, note: `${what} ${became} ${next}` });
+  }
 
   // The service refused the key this server sent. Left as it is, every call from here on
   // gets the same refusal and nothing the agent can do changes it: an api_key argument is
@@ -375,12 +482,16 @@ async function callHostedTool(name: string, given: Record<string, unknown>, canc
           ', and a key from barevalue_register will not be used either while it is set. Calling again will not help. ' +
           'Tell the user to do one of two things in the MCP configuration and then restart this server: ' +
           '(1) set BAREVALUE_API_KEY to a working key (barevalue.com, Settings, API Keys; it starts with bv_sk_), or ' +
-          '(2) remove BAREVALUE_API_KEY, after which barevalue_register gives this session a key at once.',
+          '(2) remove BAREVALUE_API_KEY, after which a key passed as api_key is used, and barevalue_register gives this session a key in one call ' +
+          'for an email address that has no Barevalue account yet. An address that already has an account is refused there: ' +
+          'its owner makes a key under Settings, API Keys, to set as in (1) or, with the variable removed, to pass as api_key.',
       });
     }
 
     // A key this session got from barevalue_register: nobody configured it, so it can go.
-    // The tools take api_key again and barevalue_register works again.
+    // The tools take api_key again, and a key from a later barevalue_register is kept again.
+    // The same address cannot be registered twice, though: it has an account now, so that
+    // call is refused, and the working key has to come from the account's owner.
     if (apiKey === sentKey) {
       apiKey = null;
     }
@@ -388,7 +499,8 @@ async function callHostedTool(name: string, given: Record<string, unknown>, canc
       session_key_forgotten: true,
       what_to_do:
         'Barevalue refused the key this session got from barevalue_register (it was revoked or has expired), so this server has dropped it. ' +
-        'Call barevalue_register again for a new key, or pass a working key as api_key.',
+        'barevalue_register will not give the same email address another key: that address has an account now, and the call is refused. ' +
+        'Ask the user for a working key (barevalue.com, Settings, API Keys; it starts with bv_sk_) and pass it as api_key.',
     });
   }
 
@@ -458,8 +570,14 @@ export function uploadAddressProblem(address: string, hostedAddress: string = HO
 /**
  * Send the file to the upload form as multipart/form-data, streamed: the form's fields
  * first, exactly as given, then the file, last. Resolves with the HTTP status.
+ *
+ * It always settles, once: with storage's whole answer, or with an error when the
+ * connection fails, goes quiet for `idleMs`, or is dropped at any point, also after the
+ * answer's headers have come. (Until 1.4.1 only the end of the answer settled it, so
+ * headers followed by a dropped connection left the call unanswered and the file open.)
+ * The handle is the caller's to close; nothing here reads from it once this has settled.
  */
-function postForm(
+export function postForm(
   url: string,
   fields: Record<string, string>,
   fileField: string,
@@ -467,7 +585,8 @@ function postForm(
   filename: string,
   size: number,
   cancel: AbortSignal,
-  onSent: (bytes: number) => void
+  onSent: (bytes: number) => void,
+  idleMs: number = UPLOAD_IDLE_TIMEOUT_MS
 ): Promise<{ status: number; body: string }> {
   if (cancel.aborted) {
     return Promise.reject(new Error(CANCELLED));
@@ -487,48 +606,106 @@ function postForm(
   const tail = `\r\n--${boundary}--\r\n`;
 
   return new Promise((resolve, reject) => {
-    const req = request(
-      target,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': `multipart/form-data; boundary=${boundary}`,
-          // S3 takes no chunked form posts: the whole length is stated up front.
-          'Content-Length': Buffer.byteLength(head) + size + Buffer.byteLength(tail),
-        },
+    const req = request(target, {
+      method: 'POST',
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        // S3 takes no chunked form posts: the whole length is stated up front.
+        'Content-Length': Buffer.byteLength(head) + size + Buffer.byteLength(tail),
       },
-      (res) => {
-        let body = '';
-        res.setEncoding('utf8');
-        res.on('data', (chunk: string) => {
-          if (body.length < 2000) {
-            body += chunk;
-          }
-        });
-        res.on('end', () => {
-          settled();
-          resolve({ status: res.statusCode ?? 0, body });
-        });
-      }
-    );
+    });
 
     // From the handle that was checked, never from the name again. No further than the
     // size already stated, should the file grow meanwhile.
     const file = handle.createReadStream({ start: 0, end: size - 1, autoClose: false });
 
-    // The client cancelled the call (or went away): stop sending at once. What was sent
-    // so far is dropped by the other side, which never got the whole form.
-    const onCancel = () => req.destroy(new Error(CANCELLED));
-    const settled = () => {
+    // The one way out, taken once: whatever comes first decides, and what comes after it
+    // (a close after an error, an error after the idle limit) changes nothing. An end
+    // with an error also ends the connection, so nothing more is sent or waited for.
+    let done = false;
+    const finish = (error: Error | null, answer?: { status: number; body: string }) => {
+      if (done) {
+        return;
+      }
+      done = true;
       cancel.removeEventListener('abort', onCancel);
       file.destroy();
+      if (error || !answer) {
+        req.destroy();
+        reject(error ?? new Error('The upload ended without an answer from storage.'));
+      } else {
+        // A refusal that came before the whole form had gone out: nothing more is sent,
+        // and the connection is not left open waiting for the rest.
+        if (!req.writableFinished) {
+          req.destroy();
+        }
+        resolve(answer);
+      }
     };
+
+    // Storage's whole answer. A yes counts only when the whole form had gone out: a 2xx
+    // that comes while the file is still being sent says nothing about the rest of it.
+    const answered = (status: number, body: string) => {
+      if (status >= 200 && status < 300 && !req.writableFinished) {
+        finish(
+          new Error(
+            `Storage answered HTTP ${status} before the whole file had been sent, so the file does not count as stored. Call barevalue_upload again to send the file.`
+          )
+        );
+        return;
+      }
+      finish(null, { status, body });
+    };
+
+    // The client cancelled the call (or went away): stop sending at once. What was sent
+    // so far is dropped by the other side, which never got the whole form.
+    const onCancel = () => finish(new Error(CANCELLED));
     cancel.addEventListener('abort', onCancel, { once: true });
 
-    req.setTimeout(UPLOAD_IDLE_TIMEOUT_MS, () => req.destroy(new Error('The upload stalled.')));
-    req.on('error', (error) => {
-      settled();
-      reject(error);
+    let answering = false;
+    req.on('response', (res) => {
+      answering = true;
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk: string) => {
+        if (body.length < 2000) {
+          body += chunk;
+        }
+      });
+      // The whole answer is in. Real storage says 204 and sends no body: that ends here too.
+      res.on('end', () => answered(res.statusCode ?? 0, body));
+      // Headers, and then the connection went before the answer was whole.
+      const cutShort = () =>
+        finish(
+          new Error(
+            `Storage dropped the connection before it finished answering (HTTP ${res.statusCode ?? 0}), so it is not known whether the file was stored. ` +
+              'Call barevalue_upload again to send the file.'
+          )
+        );
+      res.on('aborted', cutShort);
+      res.on('error', cutShort);
+      res.on('close', () => (res.complete ? answered(res.statusCode ?? 0, body) : cutShort()));
+    });
+
+    // Nothing moved in either direction for the whole limit, before the answer or in the
+    // middle of it. Settled here, not left to an error event that may never come.
+    req.setTimeout(idleMs, () =>
+      finish(
+        new Error(
+          `The upload stalled: nothing moved for ${idleMs / 1000} seconds, so it was stopped. Call barevalue_upload again to send the file.`
+        )
+      )
+    );
+    // What ends on this side (a cancel, a file that changed) is settled where it happens,
+    // in its own words, so an error here is the connection's.
+    req.on('error', (error) =>
+      finish(new Error(`The connection to storage failed (${error.message}). Call barevalue_upload again to send the file.`))
+    );
+    // The connection closed with no answer and no error to say why.
+    req.on('close', () => {
+      if (!answering) {
+        finish(new Error('The connection to storage closed before it answered. Call barevalue_upload again to send the file.'));
+      }
     });
     req.write(head);
 
@@ -537,12 +714,15 @@ function postForm(
       sent += chunk.length;
       onSent(sent);
     });
-    file.on('error', (error) => req.destroy(error));
+    file.on('error', (error) => finish(error));
     file.on('end', () => {
+      if (done) {
+        return;
+      }
       // A file that got shorter meanwhile: fewer bytes than the length stated, which the
       // other side would wait for until the idle limit.
       if (file.bytesRead < size) {
-        req.destroy(new Error('The file changed while it was being sent. Try again.'));
+        finish(new Error('The file changed while it was being sent. Try again.'));
         return;
       }
       req.end(tail);

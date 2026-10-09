@@ -7,7 +7,7 @@
         "url": "https://github.com/quietnotion/barevalue-mcp",
         "source": "github"
     },
-    "version": "1.4.1",
+    "version": "1.4.2",
     "remotes": [
         {
             "type": "streamable-http",
@@ -18,13 +18,13 @@
         {
             "registryType": "npm",
             "identifier": "barevalue-mcp",
-            "version": "1.4.1",
+            "version": "1.4.2",
             "transport": {
                 "type": "stdio"
             },
             "environmentVariables": [
                 {
-                    "description": "Optional Barevalue API key. Without one the agent calls barevalue_register and gets a key at once.",
+                    "description": "Optional Barevalue API key. Without one, barevalue_register gives a new email address a key.",
                     "isRequired": false,
                     "format": "string",
                     "isSecret": true,

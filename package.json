@@ -1,6 +1,6 @@
 {
     "name": "barevalue-mcp",
-    "version": "1.4.1",
+    "version": "1.4.2",
     "description": "MCP server for Barevalue AI podcast editing: upload a local recording or pass a link, get back an edited episode with transcript and show notes. Free for agents.",
     "mcpName": "io.github.quietnotion/barevalue",
     "main": "dist/index.js",
